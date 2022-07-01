@@ -47,11 +47,13 @@ def parse_opt():
     parser.add_argument('--patience', type=int, default=100, help='EarlyStopping patience (epochs without improvement)')
     parser.add_argument('--channel', default=3, help='image channel')
     parser.add_argument('--fusion', action='store_true', help='box sand grid fusion model')
+    parser.add_argument('--multi-dataset', action='store_true', help='multiple datasets')
     opt = parser.parse_args()
     opt.noautoanchor = True
     opt.fusion = True
     opt.epochs = 1
     opt.cfg='models/yologrid.yaml'
+    opt.multi_dataset = True
     print_args(vars(opt))
     return opt
 
@@ -75,6 +77,7 @@ def main(
         patience=100,  # EarlyStopping patience (epochs without improvement)
         channel=3,  # image channel
         fusion=False,  # box sand grid fusion model
+        multi_dataset=False,  # multiple datasets
     ):
     # Directories
     save_dir = increment_path(Path(project) / Path(cfg).stem / name, exist_ok=exist_ok)
@@ -102,8 +105,12 @@ def main(
     with open(data, errors='ignore') as f:
         data_dict = yaml.safe_load(f)  # dictionary
     path = Path(data_dict.get('path'))
-    for k in 'train', 'val', 'test':
-        data_dict[k] = str(path / data_dict[k])
+    if multi_dataset:
+        for k in 'train', 'val', 'test':
+            pass
+    else:
+        for k in 'train', 'val', 'test':
+            data_dict[k] = str(path / data_dict[k])
     train_path, val_path = data_dict['train'], data_dict['val']
     nc = int(data_dict['nc'])  # number of classes
     names = data_dict['names']  # class names
