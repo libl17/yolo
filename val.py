@@ -27,7 +27,7 @@ def parse_opt():
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='dataset.yaml path')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
+    parser.add_argument('--imgsz', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
     parser.add_argument('--grid-thres', type=float, default=0.001, help='grid threshold')
     parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
@@ -158,128 +158,129 @@ def run(
 
     # pbar
     s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
-    pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-    
-    # Batch
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
-        t1 = time_sync()
-        im = im.to(device, non_blocking=True)
-        targets = targets.to(device)
-        if fusion:
-            isbox = targets[:, 1] >= 0
-            isgrid = targets[:, 1] < 0
-            targetsneg = targets[isgrid]
-            targetspos = targets[isbox]
-        im = im.half() if half else im.float()  # uint8 to fp16/32
-        im /= 255  # 0 - 255 to 0.0 - 1.0
-        _, _, height, width = im.shape  # batch size, channels, height, width
-        t2 = time_sync()
-        dt[0] += t2 - t1
+    for mini_dataloader in dataloader:
+        pbar = tqdm(mini_dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
+        
+        # Batch
+        for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+            t1 = time_sync()
+            im = im.to(device, non_blocking=True)
+            targets = targets.to(device)
+            if fusion:
+                isbox = targets[:, 1] >= 0
+                isgrid = targets[:, 1] < 0
+                targetsneg = targets[isgrid]
+                targetspos = targets[isbox]
+            im = im.half() if half else im.float()  # uint8 to fp16/32
+            im /= 255  # 0 - 255 to 0.0 - 1.0
+            _, _, height, width = im.shape  # batch size, channels, height, width
+            t2 = time_sync()
+            dt[0] += t2 - t1
 
-        # Inference
-        out, train_out = model(im) if training else model(im, augment=augment, val=True)  # inference, loss outputs
-        dt[1] += time_sync() - t2
-        if fusion:
-            gridout = out[0]
-            out = out[1]
+            # Inference
+            out, train_out = model(im) if training else model(im, augment=augment, val=True)  # inference, loss outputs
+            dt[1] += time_sync() - t2
+            if fusion:
+                gridout = out[0]
+                out = out[1]
 
-        # Loss
-        if compute_loss:
-            loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
+            # Loss
+            if compute_loss:
+                loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls
 
-        # NMS
-        targetspos[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-        t3 = time_sync()
-        out = non_max_suppression(out, conf_thres, iou_thres, multi_label=True)
-        dt[2] += time_sync() - t3
+            # NMS
+            targetspos[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+            t3 = time_sync()
+            out = non_max_suppression(out, conf_thres, iou_thres, multi_label=True)
+            dt[2] += time_sync() - t3
 
-        # Grid ConfusionMatrix
-        if not training and fusion and grid_confusion:
-            for si, pred in enumerate(gridout):
-                # Predition grid class
-                labelsneg = targetsneg[targetsneg[:, 0] == si, 1:].to('cpu')
-                isneg = pred[:, :].max(2)[0] < grid_thres
-                predcls = pred[:, :].max(2)[1].view(pred.shape[0],pred.shape[1],1).to('cpu') + 1
-                predcls[isneg] = 0
+            # Grid ConfusionMatrix
+            if not training and fusion and grid_confusion:
+                for si, pred in enumerate(gridout):
+                    # Predition grid class
+                    labelsneg = targetsneg[targetsneg[:, 0] == si, 1:].to('cpu')
+                    isneg = pred[:, :].max(2)[0] < grid_thres
+                    predcls = pred[:, :].max(2)[1].view(pred.shape[0],pred.shape[1],1).to('cpu') + 1
+                    predcls[isneg] = 0
 
-                # Target grid class
-                targetscls = torch.full_like(predcls, 0, device='cpu')  # targets
-                for ele in labelsneg:
-                    y = (ele[2]*predcls.shape[0]).int()
-                    x = (ele[1]*predcls.shape[1]).int()
-                    elecls = ele[0].abs().int()
-                    targetscls[y, x] = elecls
+                    # Target grid class
+                    targetscls = torch.full_like(predcls, 0, device='cpu')  # targets
+                    for ele in labelsneg:
+                        y = (ele[2]*predcls.shape[0]).int()
+                        x = (ele[1]*predcls.shape[1]).int()
+                        elecls = ele[0].abs().int()
+                        targetscls[y, x] = elecls
 
-                # Build grid ConfusionMatrix
-                gridy, gridx, _ = pred.shape
-                for ii in range(gridy):
-                    for jj in range(gridx):
-                        confusion[targetscls[ii, jj, 0], predcls[ii, jj, 0]] += 1
+                    # Build grid ConfusionMatrix
+                    gridy, gridx, _ = pred.shape
+                    for ii in range(gridy):
+                        for jj in range(gridx):
+                            confusion[targetscls[ii, jj, 0], predcls[ii, jj, 0]] += 1
 
-        # Metrics of box
-        for si, pred in enumerate(out):
-            labels = targetspos[targetspos[:, 0] == si, 1:] if fusion else targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            shape = shapes[si][0]
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
+            # Metrics of box
+            for si, pred in enumerate(out):
+                labels = targetspos[targetspos[:, 0] == si, 1:] if fusion else targets[targets[:, 0] == si, 1:]
+                nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+                shape = shapes[si][0]
+                correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
+                seen += 1
 
-            if npr == 0:
-                if nl:
-                    stats.append((correct, *torch.zeros((3, 0), device=device)))
-                continue
-
-            # Predictions
-            predn = pred.clone()
-            scale_coords(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-
-            # Evaluate
-            if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
-
-        # Metrics of grid
-        if fusion:
-            for si, pred in enumerate(gridout):
-                gridy, gridx, clsnum = pred.shape
-                labelsneg = targetsneg[targetsneg[:, 0] == si, 1:]
-                predcls = pred[:, :].max(2)[1].view(pred.shape[0],pred.shape[1],1) + 1
-                predconf = pred[:, :].max(2)[0].view(pred.shape[0],pred.shape[1],1)
-                nl = len(labelsneg)
-                tcls = labelsneg[:, 0].abs().tolist() if nl else []  # target class
-                path, shape = Path(paths[si]), shapes[si][0]
-
-                targetscls = torch.full_like(predcls, 0, device=gridiouv.device)  # targets
-                for ele in labelsneg:
-                    x = (ele[1]*predcls.shape[1]).int()
-                    y = (ele[2]*predcls.shape[0]).int()
-                    elecls = ele[0].abs().int()
-                    targetscls[y, x] = elecls
-
-                if len(pred) == 0:
+                if npr == 0:
                     if nl:
-                        gridstats.append((torch.zeros(0, 1, dtype=torch.bool), torch.Tensor(), torch.Tensor(), targetscls.flatten().cpu()))
+                        stats.append((correct, *torch.zeros((3, 0), device=device)))
                     continue
+
+                # Predictions
+                predn = pred.clone()
+                scale_coords(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
                 # Evaluate
                 if nl:
-                    correct = (predcls.flatten() == targetscls.flatten())
-                else:
-                    correct = torch.zeros(gridx*gridy, 1, dtype=torch.bool)
-                gridstats.append((correct.view(correct.shape[0], 1).cpu(), predconf.flatten().cpu(), predcls.flatten().cpu(), targetscls.flatten().cpu()))  # (correct, conf, pcls, tcls)
+                    tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                    scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                    labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                    correct = process_batch(predn, labelsn, iouv)
+                    if plots:
+                        confusion_matrix.process_batch(predn, labelsn)
+                stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
 
-        # Plot images
-        if plots and batch_i < 3:
+            # Metrics of grid
             if fusion:
-                plot_images(im, targetspos, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
-            else:
-                plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
-            plot_images(im, output_to_target(out), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
+                for si, pred in enumerate(gridout):
+                    gridy, gridx, clsnum = pred.shape
+                    labelsneg = targetsneg[targetsneg[:, 0] == si, 1:]
+                    predcls = pred[:, :].max(2)[1].view(pred.shape[0],pred.shape[1],1) + 1
+                    predconf = pred[:, :].max(2)[0].view(pred.shape[0],pred.shape[1],1)
+                    nl = len(labelsneg)
+                    tcls = labelsneg[:, 0].abs().tolist() if nl else []  # target class
+                    path, shape = Path(paths[si]), shapes[si][0]
+
+                    targetscls = torch.full_like(predcls, 0, device=gridiouv.device)  # targets
+                    for ele in labelsneg:
+                        x = (ele[1]*predcls.shape[1]).int()
+                        y = (ele[2]*predcls.shape[0]).int()
+                        elecls = ele[0].abs().int()
+                        targetscls[y, x] = elecls
+
+                    if len(pred) == 0:
+                        if nl:
+                            gridstats.append((torch.zeros(0, 1, dtype=torch.bool), torch.Tensor(), torch.Tensor(), targetscls.flatten().cpu()))
+                        continue
+
+                    # Evaluate
+                    if nl:
+                        correct = (predcls.flatten() == targetscls.flatten())
+                    else:
+                        correct = torch.zeros(gridx*gridy, 1, dtype=torch.bool)
+                    gridstats.append((correct.view(correct.shape[0], 1).cpu(), predconf.flatten().cpu(), predcls.flatten().cpu(), targetscls.flatten().cpu()))  # (correct, conf, pcls, tcls)
+
+            # Plot images
+            if plots and batch_i < 3:
+                if fusion:
+                    plot_images(im, targetspos, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
+                else:
+                    plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
+                plot_images(im, output_to_target(out), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
     # Compute metrics of grid
     if fusion:
@@ -368,7 +369,7 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp_grid, mr_grid, map50_crm, crack_ap, mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist())
+    return (mp_grid, mr_grid, map50_crm, crack_ap, mp, mr, map50, map, *(loss.cpu() / sum([len(mini) for mini in dataloader])).tolist())
 
 
 def main(opt):

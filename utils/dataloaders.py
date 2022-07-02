@@ -134,33 +134,37 @@ def create_dataloader(path,
                       image_weights=False,
                       quad=False,
                       prefix='',
-                      shuffle=False):
+                      shuffle=False,):
     if rect and shuffle:
         LOGGER.warning('WARNING: --rect is incompatible with DataLoader shuffle, setting shuffle=False')
         shuffle = False
-    dataset = LoadImagesAndLabels(
-        path,
-        imgsz,
-        batch_size,
-        augment=augment,  # augmentation
-        hyp=hyp,  # hyperparameters
-        rect=rect,  # rectangular batches
-        stride=int(stride),
-        pad=pad,
-        image_weights=image_weights,
-        prefix=prefix)
+    path = [path] if not isinstance(path, list) else path
+    dataset = []
+    for mini_task in path:
+        dataset.append(LoadImagesAndLabels(
+                                            mini_task,
+                                            imgsz,
+                                            batch_size,
+                                            augment=augment,  # augmentation
+                                            hyp=hyp,  # hyperparameters
+                                            rect=rect,  # rectangular batches
+                                            stride=int(stride),
+                                            pad=pad,
+                                            image_weights=image_weights,
+                                            prefix=prefix))
 
-    batch_size = min(batch_size, len(dataset))
+    # batch_size = min(batch_size, len(dataset))
     nd = torch.cuda.device_count()  # number of CUDA devices
     nw = min([os.cpu_count() // max(nd, 1), batch_size if batch_size > 1 else 0, workers])  # number of workers
     loader = DataLoader if image_weights else InfiniteDataLoader  # only DataLoader allows for attribute updates
-    return loader(dataset,
-                  batch_size=batch_size,
-                  shuffle=shuffle,
-                  num_workers=nw,
-                  sampler=None,
-                  pin_memory=True,
-                  collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn), dataset
+    return [loader(mini_dataset,
+                    batch_size=batch_size,
+                    shuffle=shuffle,
+                    num_workers=nw,
+                    sampler=None,
+                    pin_memory=True,
+                    collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+                    for mini_dataset in dataset], dataset
 
 
 def img2label_paths(img_paths):
@@ -193,13 +197,13 @@ class LoadImagesAndLabels(Dataset):
                  stride=32,
                  pad=0.0,
                  prefix=''):
-        self.img_size = img_size
+        self.img_size = (img_size, img_size)
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
-        self.mosaic_border = [-img_size // 2, -img_size // 2]
+        self.mosaic = self.augment  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic_border = [-self.img_size[0] // 2, -self.img_size[1] // 2]
         self.stride = stride
         self.path = path
         self.album = False
@@ -275,11 +279,13 @@ class LoadImagesAndLabels(Dataset):
                 ari = ar[bi == i]
                 mini, maxi = ari.min(), ari.max()
                 if maxi < 1:
-                    shapes[i] = [maxi, 1]
-                elif mini > 1:
                     shapes[i] = [1, 1 / mini]
+                elif mini > 1:
+                    shapes[i] = [maxi, 1]
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+            self.img_size = (self.batch_shapes[0][0], self.batch_shapes[0][1])
+            self.mosaic_border = [-self.img_size[0] // 2, -self.img_size[1] // 2]
 
         # Cache images into RAM/disk for faster training (WARNING: large datasets may exceed system resources)
         self.ims = [None] * n
@@ -407,10 +413,10 @@ class LoadImagesAndLabels(Dataset):
                 im = cv2.imread(f)  # BGR
                 assert im is not None, f'Image Not Found {f}'
             h0, w0 = im.shape[:2]  # orig hw
-            r = self.img_size / max(h0, w0)  # ratio
+            r = max(self.img_size) / max(h0, w0)  # ratio
             if r != 1:  # if sizes are not equal
                 interp = cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
-                im = cv2.resize(im, (int(w0 * r), int(h0 * r)), interpolation=interp)
+                im = cv2.resize(im, (self.img_size[1], self.img_size[0]), interpolation=interp)
             return im, (h0, w0), im.shape[:2]  # im, hw_original, hw_resized
         else:
             return self.ims[i], self.im_hw0[i], self.im_hw[i]  # im, hw_original, hw_resized
@@ -425,8 +431,9 @@ class LoadImagesAndLabels(Dataset):
         # YOLOv5 4-mosaic loader. Loads 1 image + 3 random images into a 4-image mosaic
         labels4, segments4 = [], []
         s = self.img_size
-        downstride = int(s/20)
-        yc, xc = (int(random.uniform(-x/downstride, (2 * s + x)/downstride))*downstride for x in self.mosaic_border)  # mosaic center x, y
+        downstride = int(s[0]/20)
+        xc = int(random.uniform(-self.mosaic_border[1]/downstride, (2 * s[1] + self.mosaic_border[1])/downstride))*downstride  # mosaic center y
+        yc = int(random.uniform(-self.mosaic_border[0]/downstride, (2 * s[0] + self.mosaic_border[0])/downstride))*downstride  # mosaic center x
         # yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)  # mosaic center x, y
         indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
         random.shuffle(indices)
@@ -436,17 +443,17 @@ class LoadImagesAndLabels(Dataset):
 
             # place img in img4
             if i == 0:  # top left
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+                img4 = np.full((s[0] * 2, s[1] * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
             elif i == 1:  # top right
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s[1] * 2), yc
                 x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
             elif i == 2:  # bottom left
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s[0] * 2, yc + h)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
             elif i == 3:  # bottom right
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s[1] * 2), min(s[0] * 2, yc + h)
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
@@ -464,7 +471,7 @@ class LoadImagesAndLabels(Dataset):
         # Concat/clip labels
         labels4 = np.concatenate(labels4, 0)
         for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+            np.clip(x, 0, 2 * (2*s[1], 2*s[0]), out=x)  # clip when using random_perspective()
         # img4, labels4 = replicate(img4, labels4)  # replicate
 
         # Augment

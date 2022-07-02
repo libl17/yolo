@@ -1,3 +1,7 @@
 _pycache_/
 data/
 runs/
+datasets/
+.pt
+.ttf
+.yaml

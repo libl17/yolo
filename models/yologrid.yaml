@@ -1,6 +1,6 @@
 # Parameters
-nc: 5  # number of classes
-nc_grid: 3
+nc: 14  # number of classes
+nc_grid: 8
 depth_multiple: 0.33  # model depth multiple
 width_multiple: 0.50  # layer channel multiple
 anchors:

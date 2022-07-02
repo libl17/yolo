@@ -51,9 +51,12 @@ def parse_opt():
     opt = parser.parse_args()
     opt.noautoanchor = True
     opt.fusion = True
-    opt.epochs = 1
+    opt.epochs = 100
     opt.cfg='models/yologrid.yaml'
     opt.multi_dataset = True
+    opt.rect = True
+    opt.data = 'data/pavement_rural.yaml'
+    opt.imgsz = 640
     print_args(vars(opt))
     return opt
 
@@ -63,7 +66,7 @@ def main(
         cfg='models/yolov5s.yaml',  # model.yaml path
         data='data/pavement.yaml',  # dataset.yaml path
         hyp='data/hyps/hyp.pavement.yaml',  # hyperparameters path
-        epochs=1,
+        epochs=100,
         batch_size=16,  # total batch size for all GPUs
         imgsz=640,  # train, val image size (pixels)
         rect=False,  # rectangular training
@@ -107,7 +110,7 @@ def main(
     path = Path(data_dict.get('path'))
     if multi_dataset:
         for k in 'train', 'val', 'test':
-            pass
+            data_dict[k] = [str(path / mini_task) for mini_task in data_dict[k]]
     else:
         for k in 'train', 'val', 'test':
             data_dict[k] = str(path / data_dict[k])
@@ -144,7 +147,7 @@ def main(
                                               rect=rect,
                                               workers=workers,
                                               prefix=colorstr('train: '),
-                                              shuffle=True
+                                              shuffle=True,
                                               )
 
     # Validationloader
@@ -156,12 +159,12 @@ def main(
                                    rect=True,
                                    workers=workers * 2,
                                    pad=0,
-                                   prefix=colorstr('val: ')
+                                   prefix=colorstr('val: '),
                                    )[0]
 
     # Labels
     if plots:
-        labels = np.concatenate(dataset.labels, 0)
+        labels = np.vstack([np.concatenate(mini_dataset.labels, 0) for mini_dataset in dataset])
         if fusion:
             isbox = labels[:, 0] >= 0
             isgrid = labels[:, 0] < 0
@@ -191,7 +194,7 @@ def main(
     stopper = EarlyStopping(patience=patience)
     compute_loss = ComputeLoss(model, fusion=fusion)  # init loss class
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
-                f'Using {train_loader.num_workers} dataloader workers\n'
+                f'Using {train_loader[0].num_workers} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
     
@@ -202,53 +205,55 @@ def main(
         mloss = torch.zeros(4, device=device) if fusion else torch.zeros(3, device=device)  # mean losses
 
         # pbar
-        pbar = enumerate(train_loader)
-        nb = len(train_loader)  # number of batches
         if fusion:
             LOGGER.info(('\n' + '%10s' * 9) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'grid', 'boxlbs', 'gridlbs', 'img_size'))
         else:
             LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
-        pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         
-        
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
-            ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
-            if fusion:
-                isbox = targets[:, 1] >= 0
-                isgrid = targets[:, 1] < 0
-                targetsneg = targets[isgrid]
-                targetspos = targets[isbox]
-
-            # Forward
-            with torch.cuda.amp.autocast(amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+        for loader_i, mini_train_loader in enumerate(train_loader):
+            pbar = enumerate(mini_train_loader)
+            nb = len(mini_train_loader)  # number of batches
+            pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
             
-            # Optimize
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-            # Log
-            mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
-            mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G'  # (GB)
-            if fusion:
-                pbar.set_description(('%10s' * 2 + '%10.5g' * 7) %
-                                    (f'{epoch}/{epochs - 1}', mem, *mloss, targetspos.shape[0], targetsneg.shape[0], imgs.shape[-1]))
-            else:
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
-                                    (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
             
-            # runs on train batch end
-            if plots and ni < 3:
+            for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+                ni = i + nb * epoch  # number integrated batches (since train start)
+                imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
                 if fusion:
-                    plot_images(imgs, targetspos, paths, save_dir / f'train_batch_box{ni}.jpg')
-                    plot_images(imgs, targetsneg, paths, save_dir / f'train_batch_grid{ni}.jpg')
+                    isbox = targets[:, 1] >= 0
+                    isgrid = targets[:, 1] < 0
+                    targetsneg = targets[isgrid]
+                    targetspos = targets[isbox]
+
+                # Forward
+                with torch.cuda.amp.autocast(amp):
+                    pred = model(imgs)  # forward
+                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                
+                # Optimize
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                # Log
+                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                mem = f'{torch.cuda.memory_reserved() / 1E9:.3g}G'  # (GB)
+                if fusion:
+                    pbar.set_description(('%10s' * 2 + '%10.5g' * 7) %
+                                        (f'{epoch}/{epochs - 1}', mem, *mloss, targetspos.shape[0], targetsneg.shape[0], imgs.shape[-1]))
                 else:
-                    plot_images(imgs, targets, paths, save_dir / f'train_batch{ni}.jpg')
-            # end batch ------------------------------------------------------------------------------------------------
+                    pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
+                                        (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                
+                # runs on train batch end
+                if plots and ni < 3:
+                    if fusion:
+                        plot_images(imgs, targetspos, paths, save_dir / f'train_batch_box_{loader_i}_{ni}.jpg')
+                        plot_images(imgs, targetsneg, paths, save_dir / f'train_batch_grid_{loader_i}_{ni}.jpg')
+                    else:
+                        plot_images(imgs, targets, paths, save_dir / f'train_batch_{loader_i}_{ni}.jpg')
+                # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for loggers

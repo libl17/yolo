@@ -301,7 +301,7 @@ class ComputeLoss:
 
         isneg = np.ones(p.shape[0]*p.shape[1]*p.shape[2])       
         for i in range(t.shape[0]):
-            isneg[(b[i]*p.shape[1]*p.shape[2] + gj[i]*p.shape[1] + gi[i]).item()] = 0
+            isneg[(b[i]*p.shape[1]*p.shape[2] + gj[i]*p.shape[2] + gi[i]).item()] = 0
         isbackground = [x for x in range(p.shape[0]*p.shape[1]*p.shape[2]) if isneg[x]]
         b_all = b_all[isbackground]
         gi_all = gi_all[isbackground]
