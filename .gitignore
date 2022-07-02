@@ -1,7 +1,9 @@
 _pycache_/
+utils/_pycache_/
+models/_pycache_/
 data/
+datasets/
 runs/
 datasets/
-.pt
-.ttf
-.yaml
+*.pt
+*.ttf
