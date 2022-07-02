@@ -4,7 +4,6 @@ models/_pycache_/
 data/
 datasets/
 runs/
-datasets/
 *.pt
 *.ttf
 modify_file_ext.py
