@@ -451,3 +451,8 @@ def write_csv(log_vals, save_dir, epoch, fusion):
     s = '' if file.exists() else (('%20s,' * n % tuple(['epoch'] + keys)).rstrip(',') + '\n')  # add header
     with open(file, 'a') as f:
         f.write(s + ('%20.5g,' * n % tuple([epoch] + log_vals)).rstrip(',') + '\n')
+
+
+def intersect_dicts(da, db, exclude=()):
+    # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
+    return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}

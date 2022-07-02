@@ -268,7 +268,7 @@ class Model(nn.Module):
     def _apply(self, fn):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
-        m = self.model[-3] if self.fusion else self.model[-1]  # Detect()
+        m = self.model[-3] #  if self.fusion else self.model[-1]  # Detect()
         if isinstance(m, Detect):
             m.stride = fn(m.stride)
             m.grid = list(map(fn, m.grid))

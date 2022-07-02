@@ -24,7 +24,7 @@ from utils.autoanchor import check_anchors
 from utils.plots import plot_labels, plot_images, plot_results
 from utils.dataloaders import create_dataloader
 from models.experimental import attempt_load
-from utils.general import increment_path, LOGGER, colorstr, init_seeds, print_args, strip_optimizer, write_csv
+from utils.general import increment_path, LOGGER, colorstr, init_seeds, print_args, strip_optimizer, write_csv, intersect_dicts
 
 
 def parse_opt():
@@ -57,6 +57,7 @@ def parse_opt():
     opt.rect = True
     opt.data = 'data/pavement_rural.yaml'
     opt.imgsz = 640
+    opt.weights = 's_version2_1c.pt'
     print_args(vars(opt))
     return opt
 
@@ -120,7 +121,16 @@ def main(
     names_grid = data_dict['names_grid']
 
     # Model
-    model = Model(cfg, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    if weights.endswith('.pt'):
+        ckpt = torch.load(weights, map_location=device)  # load checkpoint
+        model = Model(cfg or ckpt['model'].yaml, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        exclude = ['anchor'] if (cfg or hyp.get('anchors')) else []  # exclude keys
+        csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
+        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
+        model.load_state_dict(csd, strict=False)  # load
+        LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
+    else:
+        model = Model(cfg, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = True  # PyTorch Automatic Mixed Precision (AMP)
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
 
