@@ -6,9 +6,11 @@ Usage:
     $ python path/to/train.py --data coco128.yaml --weights '' --cfg yolov5s.yaml --img 640  # from scratch
 """
 
+import os
 import yaml
 import time
 import torch
+import random
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -24,7 +26,7 @@ from utils.autoanchor import check_anchors
 from utils.plots import plot_labels, plot_images, plot_results
 from utils.dataloaders import create_dataloader
 from models.experimental import attempt_load
-from utils.general import increment_path, LOGGER, colorstr, init_seeds, print_args, strip_optimizer, write_csv, intersect_dicts
+from utils.general import increment_path, LOGGER, colorstr, init_seeds, print_args, strip_optimizer, write_csv, intersect_dicts, labels_to_class_weights, labels_to_image_weights, get_latest_run
 
 
 def parse_opt():
@@ -48,6 +50,8 @@ def parse_opt():
     parser.add_argument('--channel', default=3, help='image channel')
     parser.add_argument('--fusion', action='store_true', help='box sand grid fusion model')
     parser.add_argument('--multi-dataset', action='store_true', help='multiple datasets')
+    parser.add_argument('--image-weights', action='store_true', help='use weighted image selection for training')
+    parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     opt = parser.parse_args()
     opt.noautoanchor = True
     opt.fusion = True
@@ -58,6 +62,8 @@ def parse_opt():
     opt.data = 'data/pavement_rural.yaml'
     opt.imgsz = 640
     opt.weights = 's_version2_1c.pt'
+    opt.image_weights = True
+    opt.resume=True
     print_args(vars(opt))
     return opt
 
@@ -82,6 +88,8 @@ def main(
         channel=3,  # image channel
         fusion=False,  # box sand grid fusion model
         multi_dataset=False,  # multiple datasets
+        image_weights=False,  # use weighted image selection for training
+        resume=False,  # resume
     ):
     # Directories
     save_dir = increment_path(Path(project) / Path(cfg).stem / name, exist_ok=exist_ok)
@@ -122,9 +130,12 @@ def main(
 
     # Model
     if weights.endswith('.pt'):
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(cfg or ckpt['model'].yaml, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (cfg or hyp.get('anchors')) else []  # exclude keys
+        ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+        if resume:
+            model = Model(ckpt['model'].yaml, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        else:
+            model = Model(cfg or ckpt['model'].yaml, ch=channel, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
@@ -146,6 +157,21 @@ def main(
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
+    if weights.endswith('.pt'):
+        # Optimizer
+        if ckpt['optimizer'] is not None:
+            optimizer.load_state_dict(ckpt['optimizer'])
+            best_fitness = ckpt['best_fitness']
+
+        # Epochs
+        start_epoch = ckpt['epoch'] + 1
+        if resume:
+            assert start_epoch > 0, f'{weights} training to {epochs} epochs is finished, nothing to resume.'
+        if epochs < start_epoch:
+            LOGGER.info(f"{weights} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {epochs} more epochs.")
+            epochs += ckpt['epoch']  # finetune additional epochs
+
+        del ckpt, csd
 
     # Trainloader
     train_loader, dataset = create_dataloader(train_path,
@@ -158,6 +184,7 @@ def main(
                                               workers=workers,
                                               prefix=colorstr('train: '),
                                               shuffle=True,
+                                              image_weights=image_weights
                                               )
 
     # Validationloader
@@ -173,12 +200,11 @@ def main(
                                    )[0]
 
     # Labels
-    if plots:
-        labels = np.vstack([np.concatenate(mini_dataset.labels, 0) for mini_dataset in dataset])
-        if fusion:
-            isbox = labels[:, 0] >= 0
-            isgrid = labels[:, 0] < 0
-            labels = labels[isbox]
+    labels = np.vstack([np.concatenate(mini_dataset.labels, 0) for mini_dataset in dataset])
+    if fusion:
+        isbox = labels[:, 0] >= 0
+        labels = labels[isbox]
+    if plots and not resume:
         plot_labels(labels, names, save_dir)
 
     # Anchors
@@ -195,9 +221,11 @@ def main(
     model.hyp = hyp  # attach hyperparameters to model
     model.names = names
     model.names_grid = names_grid
+    model.class_weights = labels_to_class_weights(labels, nc).to(device) * nc  # attach class weights
 
     # Start training
     t0 = time.time()
+    maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
@@ -224,7 +252,12 @@ def main(
             pbar = enumerate(mini_train_loader)
             nb = len(mini_train_loader)  # number of batches
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-            
+
+            # Update image weights (optional, single-GPU only)
+            if image_weights:
+                cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
+                iw = labels_to_image_weights(dataset[loader_i].labels, nc=nc, class_weights=cw, fusion=fusion)  # image weights
+                dataset[loader_i].indices = random.choices(range(dataset[loader_i].n), weights=iw, k=dataset[loader_i].n)  # rand weighted idx
             
             for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
                 ni = i + nb * epoch  # number integrated batches (since train start)
@@ -271,7 +304,7 @@ def main(
 
         # mAP
         final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
-        results = val.run(data_dict,
+        results, maps = val.run(data_dict,
                         batch_size=batch_size * 2,
                         imgsz=imgsz,
                         model=model,
@@ -317,7 +350,7 @@ def main(
             strip_optimizer(f)  # strip optimizers
             if f is best:
                 LOGGER.info(f'\nValidating {f}...')
-                results = val.run(
+                results, _ = val.run(
                         data_dict,
                         batch_size=batch_size * 2,
                         imgsz=imgsz,
@@ -339,4 +372,13 @@ def main(
 
 if __name__ == '__main__':
     opt = parse_opt()
+    # Resume
+    if opt.resume:  # resume an interrupted run
+        ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
+        assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
+        with open(Path(ckpt).parent.parent / 'opt.yaml', errors='ignore') as f:
+            opt = argparse.Namespace(**yaml.safe_load(f))  # replace
+        opt.weights, opt.resume = ckpt, True  # reinstate
+        LOGGER.info(f'Resuming training from {ckpt}')
+
     main(**vars(opt))

@@ -369,7 +369,7 @@ def run(
     maps = np.zeros(nc) + map
     for i, c in enumerate(ap_class):
         maps[c] = ap[i]
-    return (mp_grid, mr_grid, map50_crm, crack_ap, mp, mr, map50, map, *(loss.cpu() / sum([len(mini) for mini in dataloader])).tolist())
+    return (mp_grid, mr_grid, map50_crm, crack_ap, mp, mr, map50, map, *(loss.cpu() / sum([len(mini) for mini in dataloader])).tolist()), maps
 
 
 def main(opt):

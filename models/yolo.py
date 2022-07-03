@@ -138,9 +138,10 @@ class Model(nn.Module):
         self.inplace = self.yaml.get('inplace', True)
         self.nc_grid = self.yaml.get('nc_grid', 0)
         self.fusion = True if self.nc_grid else False
+        self.detectnum = -3 if self.fusion else -1
 
         # Build strides, anchors
-        m = self.model[-3] if self.fusion else self.model[-1]  # Detect()
+        m = self.model[self.detectnum]  # Detect()
         if isinstance(m, Detect):
             s = 256  # 2x min stride
             m.inplace = self.inplace
@@ -208,7 +209,7 @@ class Model(nn.Module):
 
     def _clip_augmented(self, y):
         # Clip YOLOv5 augmented inference tails
-        nl = self.model[-3].nl if self.fusion else self.model[-1].nl  # number of detection layers (P3-P5)
+        nl = self.model[self.detectnum].nl  # number of detection layers (P3-P5)
         g = sum(4 ** x for x in range(nl))  # grid points
         e = 1  # exclude layer count
         i = (y[0].shape[1] // g) * sum(4 ** x for x in range(e))  # indices
@@ -233,7 +234,7 @@ class Model(nn.Module):
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
-        m = self.model[-3] if self.fusion else self.model[-1]  # Detect() module
+        m = self.model[self.detectnum]  # Detect() module
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.view(m.na, -1).detach()  # conv.bias(255) to (3,85)
             b[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
@@ -241,7 +242,7 @@ class Model(nn.Module):
             mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
     def _print_biases(self):
-        m = self.model[-3] if self.fusion else self.model[-1]  # Detect() module
+        m = self.model[self.detectnum]  # Detect() module
         for mi in m.m:  # from
             b = mi.bias.detach().view(m.na, -1).T  # conv.bias(255) to (3,85)
             LOGGER.info(
